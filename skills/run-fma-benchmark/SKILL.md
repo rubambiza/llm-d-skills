@@ -38,19 +38,19 @@ of hot/warm/cold per run is stochastic; see `references/actuation-mix.md`.
 This skill is model-agnostic. FMA runs any vLLM-compatible open model. **Do not
 assume a model.** Ask the user:
 
-1. **Confirm the target cluster + namespace (default to the current context).**
-   The user owns `oc login`; this skill does not log in. **Detect and surface the
-   current context, and use it by default** — do not ask the user to supply a
-   namespace from scratch. Run `kubectl config current-context` and derive the
-   namespace (`kubectl config view --minify -o jsonpath='{..namespace}'`, falling
-   back to asking only if none is set), then tell the user plainly: *"This will
-   run against context `<ctx>`, namespace `<ns>`."* Proceed on that unless the
-   user names a different namespace/context. FMA uses shared cluster GPUs, so this
-   is a one-line confirmation, not a silent assumption.
-   - If the user prefers their current context not move, they can pin a kubeconfig
-     per command instead — pass `--kubeconfig <path>` (or `KUBECONFIG=<path>`) on
-     the `kubectl` checks and point the run at that namespace with `-p <ns>`; the
-     `llmdbenchmark` steps already take `-p $NS` explicitly.
+1. **Require an explicit benchmark namespace (surface the detected one as a
+   reference default).** The user owns `oc login`; this skill does not log in. Run
+   `kubectl config current-context` and derive the current namespace
+   (`kubectl config view --minify -o jsonpath='{..namespace}'`), then surface it
+   for reference, but do NOT proceed on it silently. The user must either (a) type
+   an explicit namespace to use, or (b) pass a kubeconfig pointer
+   (`--kubeconfig <path>` / `KUBECONFIG=<path>`). A dedicated benchmark namespace
+   is strongly preferred, because the mandatory teardown removes workloads from
+   whatever namespace is chosen and FMA uses shared cluster GPUs.
+   - Whichever context/kubeconfig is settled here MUST also flow through to the
+     `llmdbenchmark` standup/run/teardown invocations (`--kubeconfig <path>` or
+     `KUBECONFIG`, and `-p <ns>`), so the cluster we check is the same one we
+     deploy to and tear down. Never check one context and act on another.
 2. **Which open model(s)?** Ideally with the HuggingFace ID (e.g. `Qwen/Qwen3-8B`).
    Prefer ungated models — a gated model (e.g. `meta-llama/Llama-3.1-8B-Instruct`)
    needs both an `HF_TOKEN` and per-model access approval on HuggingFace, which
@@ -223,13 +223,15 @@ copy is local by the time teardown runs.
 
 ### Step 5 — Verify results exist, then parse
 
-**On current FMA (v0.7.0+) a successful run PACKS results into an archive — there
-is no loose `result.yaml` to `find`.** The run collects
-`<WS>/<workspace-id>/results/nop-*_1/workspace.tar.zst`, and `result.yaml` lives
-*inside* it. (`find $WS -name result.yaml` returns nothing on a clean run — that
-is expected, not a failure.) Loose, uncompressed result files appear ONLY when a
-run fails ("collecting results uncompressed"), so compressed-vs-loose is itself a
-success/failure signal.
+**Results may be compressed or loose — do NOT treat the layout as a
+success/failure signal.** By default a run packs results into
+`<WS>/<workspace-id>/results/nop-*_1/workspace.tar.zst` with `result.yaml`
+*inside* it. But a successful run can also be loose: compression is a user option
+(`--no-compress`), and a run can finish successfully with only a warning if
+compression fails. So support BOTH layouts — if `workspace.tar.zst` exists,
+extract it; otherwise read the loose `result.yaml` directly. Validate the actual
+measurements, not the directory shape: a run with zero iterations or no valid
+timing samples must fail explicitly.
 
 Confirm the archive exists, then extract and parse:
 
@@ -259,6 +261,12 @@ interpret it. Report, per model:
   in seconds.
 - **`timing_source`**: confirm `dpc` for all (note if any fell back to a Kube
   anchor — those are looser and should be flagged, not silently averaged).
+- **Run provenance (so runs are comparable):** the engine **image**
+  (`scenario.platform.engines[].image`), the **effective config** (`sleep_mode`,
+  `kv_cache_memory_bytes`, key vLLM args), and **cache state** from `vllm_metrics`
+  — `torch_compile` (a fresh JIT compile) vs `load_cached_compiled_graph` (a
+  reused compiled graph), alongside `warm_hit_rate` / actuation condition. These
+  distinguish a warm JIT cache from a warm FMA launcher when comparing runs.
 
 Then a plain-English synopsis: one line defining each path (hot = waking a
 sleeping instance, sub-second; warm = launcher forks a new instance, ~tens of
